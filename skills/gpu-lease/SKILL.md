@@ -1,3 +1,8 @@
+---
+name: gpu-lease
+description: Use before running local GPU workloads such as PyTorch, SGLang serving, Ray clusters, CUDA benchmarks, or scripts that use GPUs; instructs agents to wrap commands with gpu-lease run so CUDA_VISIBLE_DEVICES is set through a lease.
+---
+
 # GPU Lease
 
 Use this skill before running local GPU workloads from Codex or another code agent.
