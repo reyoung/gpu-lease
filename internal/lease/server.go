@@ -71,14 +71,29 @@ func (s *Server) handle(conn net.Conn) {
 
 	switch req.Action {
 	case actionLease:
-		leaseID, err := s.manager.Lease(req.IDs)
+		if len(req.IDs) > 0 && req.Count > 0 {
+			_ = encoder.Encode(Response{OK: false, Error: "ids and count cannot both be set"})
+			return
+		}
+
+		var (
+			leaseID string
+			ids     []int
+			err     error
+		)
+		if req.Count > 0 {
+			leaseID, ids, err = s.manager.LeaseAny(req.Count, req.Wait)
+		} else {
+			leaseID, err = s.manager.LeaseIDs(req.IDs, req.Wait)
+			ids = req.IDs
+		}
 		if err != nil {
 			_ = encoder.Encode(Response{OK: false, Error: err.Error()})
 			return
 		}
 		defer s.manager.Release(leaseID)
 
-		if err := encoder.Encode(Response{OK: true, Lease: leaseID}); err != nil {
+		if err := encoder.Encode(Response{OK: true, Lease: leaseID, IDs: ids}); err != nil {
 			return
 		}
 		_, _ = reader.ReadByte()

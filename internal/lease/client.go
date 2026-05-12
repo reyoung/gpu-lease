@@ -8,16 +8,33 @@ import (
 
 type HeldLease struct {
 	ID   string
+	IDs  []int
 	conn net.Conn
 }
 
+type AcquireOptions struct {
+	IDs   []int
+	Count int
+	Wait  bool
+}
+
 func Acquire(socketPath string, ids []int) (*HeldLease, error) {
+	return AcquireWithOptions(socketPath, AcquireOptions{IDs: ids})
+}
+
+func AcquireWithOptions(socketPath string, opts AcquireOptions) (*HeldLease, error) {
 	conn, err := net.Dial("unix", socketPath)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := json.NewEncoder(conn).Encode(Request{Action: actionLease, IDs: ids}); err != nil {
+	req := Request{
+		Action: actionLease,
+		IDs:    opts.IDs,
+		Count:  opts.Count,
+		Wait:   opts.Wait,
+	}
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -31,7 +48,7 @@ func Acquire(socketPath string, ids []int) (*HeldLease, error) {
 		conn.Close()
 		return nil, errors.New(resp.Error)
 	}
-	return &HeldLease{ID: resp.Lease, conn: conn}, nil
+	return &HeldLease{ID: resp.Lease, IDs: resp.IDs, conn: conn}, nil
 }
 
 func (l *HeldLease) Close() error {

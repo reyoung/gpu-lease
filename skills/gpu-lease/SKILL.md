@@ -16,7 +16,15 @@ CUDA benchmarks, and scripts that import GPU frameworks or launch GPU-serving pr
    Do not start a new daemon for routine GPU work. Do not pass `--socket` or set
    `GPU_LEASE_SOCKET` unless the user explicitly provides another socket.
 
-2. Wrap every GPU command with `gpu-lease run` and the exact GPU IDs you intend to use:
+2. Wrap every GPU command with `gpu-lease run`. By default, request the number of GPUs
+   you need with `--count` and include `--wait` so the command starts when GPUs are
+   ready:
+
+   ```bash
+   gpu-lease run --count 2 --wait -- python train.py --batch-size 8
+   ```
+
+   Use exact GPU IDs only when the user specifically requires fixed devices:
 
    ```bash
    gpu-lease run --ids 0,1 -- python train.py --batch-size 8
@@ -31,7 +39,7 @@ CUDA benchmarks, and scripts that import GPU frameworks or launch GPU-serving pr
 ## Examples
 
 ```bash
-gpu-lease run --ids 0 -- python -m torch.distributed.run --nproc_per_node=1 train.py
-gpu-lease run --ids 2,3 -- python -m sglang.launch_server --model-path ./model
-gpu-lease run --ids 0,1,2,3 -- ray start --head --num-gpus=4
+gpu-lease run --count 1 --wait -- python -m torch.distributed.run --nproc_per_node=1 train.py
+gpu-lease run --count 2 --wait -- python -m sglang.launch_server --model-path ./model
+gpu-lease run --count 4 --wait -- ray start --head --num-gpus=4
 ```

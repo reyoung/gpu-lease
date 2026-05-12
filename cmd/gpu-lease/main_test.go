@@ -72,6 +72,95 @@ func TestRunCommandSetsCUDAVisibleDevicesAndReleasesLease(t *testing.T) {
 	}
 }
 
+func TestRunCommandCanLeaseByCount(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket command test")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	socketPath := filepath.Join(t.TempDir(), "gpu-lease.sock")
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- lease.NewServer(lease.NewManagerWithAvailableIDs([]int{0, 1, 2})).ListenAndServe(ctx, socketPath)
+	}()
+	waitForSocket(t, socketPath)
+
+	code := run([]string{
+		"run",
+		"--socket", socketPath,
+		"--num", "2",
+		"--",
+		"/bin/sh", "-c", `test "$CUDA_VISIBLE_DEVICES" = "0,1"`,
+	})
+	if code != 0 {
+		t.Fatalf("run returned %d, want 0", code)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("server returned error: %v", err)
+	}
+}
+
+func TestRunCommandWaitsForCount(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket command test")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	socketPath := filepath.Join(t.TempDir(), "gpu-lease.sock")
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- lease.NewServer(lease.NewManagerWithAvailableIDs([]int{0})).ListenAndServe(ctx, socketPath)
+	}()
+	waitForSocket(t, socketPath)
+
+	held, err := lease.AcquireWithOptions(socketPath, lease.AcquireOptions{Count: 1})
+	if err != nil {
+		t.Fatalf("AcquireWithOptions failed: %v", err)
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		done <- run([]string{
+			"run",
+			"--socket", socketPath,
+			"--num", "1",
+			"--wait",
+			"--",
+			"/bin/sh", "-c", `test "$CUDA_VISIBLE_DEVICES" = "0"`,
+		})
+	}()
+
+	select {
+	case code := <-done:
+		t.Fatalf("run returned %d before lease was released", code)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if err := held.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("run returned %d, want 0", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return after lease was released")
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("server returned error: %v", err)
+	}
+}
+
 func waitForSocket(t *testing.T, socketPath string) {
 	t.Helper()
 

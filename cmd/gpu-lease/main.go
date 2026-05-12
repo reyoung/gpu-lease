@@ -45,6 +45,7 @@ func usage(out *os.File) {
 	fmt.Fprintf(out, `Usage:
   gpu-lease daemon [--socket PATH] [PATH]
   gpu-lease run --ids 0,1 -- command [args...]
+  gpu-lease run --count 2 [--wait] -- command [args...]
   gpu-lease status [--socket PATH]
 
 Environment:
@@ -72,7 +73,7 @@ func daemon(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := lease.NewServer(nil).ListenAndServe(ctx, socketPath); err != nil {
+	if err := lease.NewServer(lease.NewManagerWithAvailableIDs(lease.DiscoverGPUIDs())).ListenAndServe(ctx, socketPath); err != nil {
 		fmt.Fprintf(os.Stderr, "daemon: %v\n", err)
 		return 1
 	}
@@ -83,6 +84,9 @@ func runCommand(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	idsRaw := fs.String("ids", "", "comma-separated GPU IDs to lease")
+	num := fs.Int("num", 0, "number of GPUs to lease")
+	count := fs.Int("count", 0, "number of GPUs to lease")
+	wait := fs.Bool("wait", false, "wait until requested GPUs are available")
 	socketFlag := fs.String("socket", "", "unix socket path")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -92,13 +96,33 @@ func runCommand(args []string) int {
 		return 2
 	}
 
-	ids, err := lease.ParseIDs(*idsRaw)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "run: %v\n", err)
+	if *num > 0 && *count > 0 && *num != *count {
+		fmt.Fprintln(os.Stderr, "run: --num and --count cannot specify different values")
+		return 2
+	}
+	requestedCount := *num
+	if requestedCount == 0 {
+		requestedCount = *count
+	}
+
+	opts := lease.AcquireOptions{Count: requestedCount, Wait: *wait}
+	if *idsRaw != "" {
+		if requestedCount > 0 {
+			fmt.Fprintln(os.Stderr, "run: --ids cannot be used with --num or --count")
+			return 2
+		}
+		ids, err := lease.ParseIDs(*idsRaw)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "run: %v\n", err)
+			return 2
+		}
+		opts.IDs = ids
+	} else if requestedCount <= 0 {
+		fmt.Fprintln(os.Stderr, "run: either --ids, --num, or --count must be specified")
 		return 2
 	}
 
-	held, err := lease.Acquire(lease.SocketPath(*socketFlag), ids)
+	held, err := lease.AcquireWithOptions(lease.SocketPath(*socketFlag), opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "run: acquire lease: %v\n", err)
 		return 1
@@ -110,7 +134,11 @@ func runCommand(args []string) int {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = appendEnv(os.Environ(), "CUDA_VISIBLE_DEVICES", lease.IDsEnv(ids))
+	heldIDs := held.IDs
+	if len(heldIDs) == 0 {
+		heldIDs = opts.IDs
+	}
+	cmd.Env = appendEnv(os.Environ(), "CUDA_VISIBLE_DEVICES", lease.IDsEnv(heldIDs))
 
 	if err := cmd.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {

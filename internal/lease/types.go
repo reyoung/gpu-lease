@@ -18,12 +18,15 @@ const (
 type Request struct {
 	Action string `json:"action"`
 	IDs    []int  `json:"ids,omitempty"`
+	Count  int    `json:"count,omitempty"`
+	Wait   bool   `json:"wait,omitempty"`
 }
 
 type Response struct {
 	OK     bool              `json:"ok"`
 	Error  string            `json:"error,omitempty"`
 	Lease  string            `json:"lease,omitempty"`
+	IDs    []int             `json:"ids,omitempty"`
 	Leases map[string]string `json:"leases,omitempty"`
 }
 
