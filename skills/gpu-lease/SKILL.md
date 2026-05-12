@@ -12,14 +12,9 @@ CUDA benchmarks, and scripts that import GPU frameworks or launch GPU-serving pr
 
 ## Workflow
 
-1. Start or locate the daemon for the machine:
-
-   ```bash
-   gpu-lease daemon /var/run/gpu-lease.sock
-   ```
-
-   The default socket is `/var/run/gpu-lease.sock`. Override it with `GPU_LEASE_SOCKET`
-   or pass `--socket PATH` to `gpu-lease` commands.
+1. Use the machine daemon through the default socket `/var/run/gpu-lease.sock`.
+   Do not start a new daemon for routine GPU work. Do not pass `--socket` or set
+   `GPU_LEASE_SOCKET` unless the user explicitly provides another socket.
 
 2. Wrap every GPU command with `gpu-lease run` and the exact GPU IDs you intend to use:
 
