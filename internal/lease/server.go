@@ -37,6 +37,10 @@ func (s *Server) ListenAndServe(ctx context.Context, socketPath string) error {
 	if err != nil {
 		return err
 	}
+	if err := os.Chmod(socketPath, 0666); err != nil {
+		listener.Close()
+		return err
+	}
 	defer listener.Close()
 	defer os.Remove(socketPath)
 

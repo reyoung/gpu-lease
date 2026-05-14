@@ -2,7 +2,9 @@ package lease
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -139,6 +141,36 @@ func TestServerLeaseWaits(t *testing.T) {
 		t.Fatalf("waiting acquire returned error: %v", err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("waiting acquire did not return after release")
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("server returned error: %v", err)
+	}
+}
+
+func TestServerSocketIsWorldAccessibleWithRestrictiveUmask(t *testing.T) {
+	oldUmask := syscall.Umask(0077)
+	t.Cleanup(func() {
+		syscall.Umask(oldUmask)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	socketPath := filepath.Join(t.TempDir(), "gpu-lease.sock")
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- NewServer(NewManagerWithAvailableIDs([]int{0})).ListenAndServe(ctx, socketPath)
+	}()
+	waitForSocket(t, socketPath)
+
+	info, err := os.Stat(socketPath)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0666 {
+		t.Fatalf("socket mode = %o, want 666", got)
 	}
 
 	cancel()
