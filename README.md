@@ -12,6 +12,13 @@ Start the daemon:
 gpu-lease daemon /var/run/gpu-lease.sock
 ```
 
+Optionally keep every daemon-discovered idle GPU busy with a cuBLAS matmul
+worker until it is leased:
+
+```bash
+gpu-lease daemon --busy-matmul /var/run/gpu-lease.sock
+```
+
 Run a GPU command:
 
 ```bash
@@ -45,6 +52,11 @@ older examples.
 ## Development
 
 ```bash
-go test ./...
-go build ./cmd/gpu-lease
+cmake -S . -B build
+cmake --build build -j
+ctest --test-dir build --output-on-failure
 ```
+
+The project builds a single Linux C++17 binary named `gpu-lease`. CUDA Toolkit is
+required at build time because the daemon links against CUDA runtime and cuBLAS
+for `--busy-matmul`.
