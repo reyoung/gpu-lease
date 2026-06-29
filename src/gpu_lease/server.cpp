@@ -1,5 +1,7 @@
 #include "gpu_lease/server.h"
 
+#include "gpu_lease/gpu_state.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -14,6 +16,7 @@
 #include <unistd.h>
 
 #include <iostream>
+#include <sstream>
 #include <utility>
 
 namespace gpu_lease {
@@ -550,6 +553,25 @@ bool Server::TryAcquire(const Request& request, std::string* lease_id,
 
   if (busy_) {
     busy_->StopForLease(selection.ids);
+  }
+  PrepareGPUsOptions prepare_options;
+  std::ostringstream prepare_log;
+  if (!PrepareLeasedGPUs(selection.ids, prepare_options, prepare_log)) {
+    if (!prepare_log.str().empty()) {
+      std::cerr << prepare_log.str();
+    }
+    if (busy_) {
+      busy_->RestartReleased(selection.ids, manager_);
+    }
+    *error = prepare_log.str();
+    while (!error->empty() &&
+           (error->back() == '\n' || error->back() == '\r')) {
+      error->pop_back();
+    }
+    return false;
+  }
+  if (!prepare_log.str().empty()) {
+    std::cerr << prepare_log.str();
   }
   *lease_id = manager_.Assign(selection.ids);
   *ids = std::move(selection.ids);

@@ -37,6 +37,12 @@ Wait until the requested GPUs are available:
 gpu-lease run --num 2 --wait -- some_command --with -args
 ```
 
+Before the daemon grants each lease, it uses NVML to clean up the leased physical
+GPUs. It kills any compute process on those GPUs that is not a `gpu-lease`
+process, then waits until NVML reports both `memory.used == 0` and
+`gpu_util == 0`. This keeps the child command from racing with stale dummy GEMM
+work or other unmanaged leftovers.
+
 Inspect active leases:
 
 ```bash
@@ -48,6 +54,11 @@ The default socket path is `/var/run/gpu-lease.sock`. Set `GPU_LEASE_SOCKET` or 
 
 The daemon command also accepts the misspelled alias `deamon` for compatibility with
 older examples.
+
+Pre-lease cleanup is enabled by default in the daemon. For tests or emergency
+debugging, set `GPU_LEASE_DISABLE_PRESTART_CHECK=1` in the daemon environment to
+skip it. The wait loop can be tuned with `GPU_LEASE_PRESTART_TIMEOUT_MS` and
+`GPU_LEASE_PRESTART_POLL_MS`.
 
 ## Development
 

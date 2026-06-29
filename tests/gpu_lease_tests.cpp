@@ -365,6 +365,7 @@ void RunTest(const std::string& name, TestFn fn) {
 }  // namespace
 
 int main() {
+  setenv("GPU_LEASE_DISABLE_PRESTART_CHECK", "1", 1);
   try {
     RunTest("parse ids and socket path", TestParseIDsAndSocketPath);
     RunTest("manager and status json", TestManagerAndStatusJson);

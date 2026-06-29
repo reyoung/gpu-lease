@@ -14,6 +14,7 @@ add_library(gpu_lease_core STATIC
   src/gpu_lease/busy.cpp
   src/gpu_lease/client.cpp
   src/gpu_lease/common.cpp
+  src/gpu_lease/gpu_state.cpp
   src/gpu_lease/manager.cpp
   src/gpu_lease/server.cpp
 )
@@ -25,6 +26,7 @@ target_link_libraries(gpu_lease_core PUBLIC
   CUDA::cublas
   CUDA::cudart
   Threads::Threads
+  ${CMAKE_DL_LIBS}
 )
 
 add_executable(gpu-lease src/main.cpp)

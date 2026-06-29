@@ -36,6 +36,12 @@ CUDA benchmarks, and scripts that import GPU frameworks or launch GPU-serving pr
 4. Keep the GPU process as the direct child of `gpu-lease run`. The lease is released
    when that command exits.
 
+5. The daemon performs cleanup before granting each lease. It kills unmanaged
+   compute processes on the leased physical GPUs, then waits for NVML
+   `memory.used` and GPU utilization to reach zero. Do not bypass this unless you
+   are running tests or explicitly debugging lease startup;
+   `GPU_LEASE_DISABLE_PRESTART_CHECK=1` disables it in the daemon environment.
+
 ## Examples
 
 ```bash
