@@ -39,9 +39,10 @@ gpu-lease run --num 2 --wait -- some_command --with -args
 
 Before the daemon grants each lease, it uses NVML to clean up the leased physical
 GPUs. It kills any compute process on those GPUs that is not a `gpu-lease`
-process, then waits until NVML reports both `memory.used == 0` and
-`gpu_util == 0`. This keeps the child command from racing with stale dummy GEMM
-work or other unmanaged leftovers.
+process, then waits until NVML reports `gpu_util == 0` and no unmanaged compute
+process remains. NVML can keep driver/context memory charged briefly after a
+process exits, so memory with no compute process is treated as driver residue
+rather than stale dummy GEMM work.
 
 Inspect active leases:
 

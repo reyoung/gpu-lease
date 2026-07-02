@@ -5,8 +5,14 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#include <atomic>
-#include <future>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <chrono>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -22,137 +28,271 @@ std::string CublasErrorString(cublasStatus_t status) {
   return "cuBLAS status " + std::to_string(static_cast<int>(status));
 }
 
-struct InitResult {
-  bool ok = false;
-  std::string error;
-};
+volatile sig_atomic_t g_child_stop = 0;
+
+bool WriteAllFd(int fd, const std::string& data);
 
 class CublasBusyWorker final : public BusyWorker {
  public:
-  explicit CublasBusyWorker(std::thread thread,
-                            std::shared_ptr<std::atomic<bool>> stop)
-      : thread_(std::move(thread)), stop_(std::move(stop)) {}
+  CublasBusyWorker(pid_t pid, int stop_fd) : pid_(pid), stop_fd_(stop_fd) {}
 
   ~CublasBusyWorker() override { Stop(); }
 
   void Stop() override {
-    if (stop_) {
-      stop_->store(true, std::memory_order_relaxed);
+    if (pid_ <= 0) return;
+
+    if (stop_fd_ >= 0) {
+      (void)WriteAllFd(stop_fd_, "x");
+      close(stop_fd_);
+      stop_fd_ = -1;
     }
-    if (thread_.joinable()) {
-      thread_.join();
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline) {
+      int status = 0;
+      const pid_t got = waitpid(pid_, &status, WNOHANG);
+      if (got == pid_) {
+        pid_ = -1;
+        return;
+      }
+      if (got < 0 && errno == ECHILD) {
+        pid_ = -1;
+        return;
+      }
+      if (got < 0 && errno != EINTR) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+
+    (void)kill(pid_, SIGTERM);
+    const auto term_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < term_deadline) {
+      int status = 0;
+      const pid_t got = waitpid(pid_, &status, WNOHANG);
+      if (got == pid_ || (got < 0 && errno == ECHILD)) {
+        pid_ = -1;
+        return;
+      }
+      if (got < 0 && errno != EINTR) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    (void)kill(pid_, SIGKILL);
+    while (true) {
+      int status = 0;
+      const pid_t got = waitpid(pid_, &status, 0);
+      if (got == pid_ || (got < 0 && errno == ECHILD)) break;
+      if (got < 0 && errno == EINTR) continue;
+      break;
+    }
+    pid_ = -1;
   }
 
  private:
-  std::thread thread_;
-  std::shared_ptr<std::atomic<bool>> stop_;
+  pid_t pid_ = -1;
+  int stop_fd_ = -1;
 };
 
-std::unique_ptr<BusyWorker> StartCublasWorker(int gpu_id, std::string* error) {
-  auto stop = std::make_shared<std::atomic<bool>>(false);
-  std::promise<InitResult> init_promise;
-  std::future<InitResult> init_future = init_promise.get_future();
-
-  std::thread worker([gpu_id, stop, promise = std::move(init_promise)]() mutable {
-    cudaStream_t stream = nullptr;
-    cublasHandle_t handle = nullptr;
-    float* a = nullptr;
-    float* b = nullptr;
-    float* c = nullptr;
-
-    auto cleanup = [&]() {
-      if (a != nullptr) cudaFree(a);
-      if (b != nullptr) cudaFree(b);
-      if (c != nullptr) cudaFree(c);
-      if (handle != nullptr) cublasDestroy(handle);
-      if (stream != nullptr) cudaStreamDestroy(stream);
-    };
-
-    auto fail = [&](const std::string& msg) {
-      cleanup();
-      promise.set_value(InitResult{false, msg});
-    };
-
-    cudaError_t cuda_status = cudaSetDevice(gpu_id);
-    if (cuda_status != cudaSuccess) {
-      fail("cudaSetDevice(" + std::to_string(gpu_id) + "): " +
-           CudaErrorString(cuda_status));
-      return;
+bool WriteAllFd(int fd, const std::string& data) {
+  size_t offset = 0;
+  while (offset < data.size()) {
+    const ssize_t n = write(fd, data.data() + offset, data.size() - offset);
+    if (n > 0) {
+      offset += static_cast<size_t>(n);
+      continue;
     }
+    if (n < 0 && errno == EINTR) continue;
+    return false;
+  }
+  return true;
+}
 
-    cuda_status = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-    if (cuda_status != cudaSuccess) {
-      fail("cudaStreamCreateWithFlags: " + CudaErrorString(cuda_status));
-      return;
+std::string ReadAllFd(int fd) {
+  std::string out;
+  char buffer[512];
+  while (true) {
+    const ssize_t n = read(fd, buffer, sizeof(buffer));
+    if (n > 0) {
+      out.append(buffer, static_cast<size_t>(n));
+      continue;
     }
+    if (n == 0) break;
+    if (errno == EINTR) continue;
+    break;
+  }
+  return out;
+}
 
-    cublasStatus_t cublas_status = cublasCreate(&handle);
+void CloseInheritedFdsExcept(int keep_fd0, int keep_fd1) {
+  long max_fd = sysconf(_SC_OPEN_MAX);
+  if (max_fd < 0) max_fd = 4096;
+  for (int fd = 3; fd < max_fd; ++fd) {
+    if (fd == keep_fd0 || fd == keep_fd1) continue;
+    close(fd);
+  }
+}
+
+void BusyChildSignalHandler(int) { g_child_stop = 1; }
+
+bool StopRequested(int stop_fd) {
+  if (g_child_stop) return true;
+  char buffer[16];
+  while (true) {
+    const ssize_t n = read(stop_fd, buffer, sizeof(buffer));
+    if (n > 0 || n == 0) return true;
+    if (errno == EINTR) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return false;
+    return true;
+  }
+}
+
+int RunCublasWorkerChild(int gpu_id, int init_fd, int stop_fd) {
+  CloseInheritedFdsExcept(init_fd, stop_fd);
+  signal(SIGTERM, BusyChildSignalHandler);
+  signal(SIGINT, BusyChildSignalHandler);
+
+  cudaStream_t stream = nullptr;
+  cublasHandle_t handle = nullptr;
+  float* a = nullptr;
+  float* b = nullptr;
+  float* c = nullptr;
+  bool device_set = false;
+
+  auto cleanup = [&]() {
+    if (a != nullptr) cudaFree(a);
+    if (b != nullptr) cudaFree(b);
+    if (c != nullptr) cudaFree(c);
+    if (handle != nullptr) cublasDestroy(handle);
+    if (stream != nullptr) cudaStreamDestroy(stream);
+    if (device_set) cudaDeviceReset();
+  };
+
+  auto fail = [&](const std::string& msg) {
+    cleanup();
+    (void)WriteAllFd(init_fd, "ERR " + msg);
+    close(init_fd);
+    return 1;
+  };
+
+  cudaError_t cuda_status = cudaSetDevice(gpu_id);
+  if (cuda_status != cudaSuccess) {
+    return fail("cudaSetDevice(" + std::to_string(gpu_id) + "): " +
+                CudaErrorString(cuda_status));
+  }
+  device_set = true;
+
+  cuda_status = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+  if (cuda_status != cudaSuccess) {
+    return fail("cudaStreamCreateWithFlags: " + CudaErrorString(cuda_status));
+  }
+
+  cublasStatus_t cublas_status = cublasCreate(&handle);
+  if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+    return fail("cublasCreate: " + CublasErrorString(cublas_status));
+  }
+  cublas_status = cublasSetStream(handle, stream);
+  if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+    return fail("cublasSetStream: " + CublasErrorString(cublas_status));
+  }
+
+  constexpr int n = 1024;
+  constexpr size_t bytes = static_cast<size_t>(n) * n * sizeof(float);
+  cuda_status = cudaMalloc(&a, bytes);
+  if (cuda_status != cudaSuccess) {
+    return fail("cudaMalloc A: " + CudaErrorString(cuda_status));
+  }
+  cuda_status = cudaMalloc(&b, bytes);
+  if (cuda_status != cudaSuccess) {
+    return fail("cudaMalloc B: " + CudaErrorString(cuda_status));
+  }
+  cuda_status = cudaMalloc(&c, bytes);
+  if (cuda_status != cudaSuccess) {
+    return fail("cudaMalloc C: " + CudaErrorString(cuda_status));
+  }
+
+  cudaMemsetAsync(a, 1, bytes, stream);
+  cudaMemsetAsync(b, 2, bytes, stream);
+  cudaMemsetAsync(c, 0, bytes, stream);
+  cuda_status = cudaStreamSynchronize(stream);
+  if (cuda_status != cudaSuccess) {
+    return fail("initial cudaStreamSynchronize: " + CudaErrorString(cuda_status));
+  }
+
+  (void)WriteAllFd(init_fd, "OK");
+  close(init_fd);
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  while (!StopRequested(stop_fd)) {
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) {
+      break;
+    }
+    cublas_status = cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+                                &alpha, a, n, b, n, &beta, c, n);
     if (cublas_status != CUBLAS_STATUS_SUCCESS) {
-      fail("cublasCreate: " + CublasErrorString(cublas_status));
-      return;
+      break;
     }
-    cublas_status = cublasSetStream(handle, stream);
-    if (cublas_status != CUBLAS_STATUS_SUCCESS) {
-      fail("cublasSetStream: " + CublasErrorString(cublas_status));
-      return;
-    }
-
-    constexpr int n = 4096;
-    constexpr size_t bytes = static_cast<size_t>(n) * n * sizeof(float);
-    cuda_status = cudaMalloc(&a, bytes);
-    if (cuda_status != cudaSuccess) {
-      fail("cudaMalloc A: " + CudaErrorString(cuda_status));
-      return;
-    }
-    cuda_status = cudaMalloc(&b, bytes);
-    if (cuda_status != cudaSuccess) {
-      fail("cudaMalloc B: " + CudaErrorString(cuda_status));
-      return;
-    }
-    cuda_status = cudaMalloc(&c, bytes);
-    if (cuda_status != cudaSuccess) {
-      fail("cudaMalloc C: " + CudaErrorString(cuda_status));
-      return;
-    }
-
-    cudaMemsetAsync(a, 1, bytes, stream);
-    cudaMemsetAsync(b, 2, bytes, stream);
-    cudaMemsetAsync(c, 0, bytes, stream);
     cuda_status = cudaStreamSynchronize(stream);
     if (cuda_status != cudaSuccess) {
-      fail("initial cudaStreamSynchronize: " + CudaErrorString(cuda_status));
-      return;
+      break;
     }
+  }
 
-    promise.set_value(InitResult{true, ""});
+  cleanup();
+  close(stop_fd);
+  return 0;
+}
 
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    while (!stop->load(std::memory_order_relaxed)) {
-      cublas_status = cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
-                                  &alpha, a, n, b, n, &beta, c, n);
-      if (cublas_status != CUBLAS_STATUS_SUCCESS) {
-        break;
-      }
-      cuda_status = cudaStreamSynchronize(stream);
-      if (cuda_status != cudaSuccess) {
-        break;
-      }
-    }
-
-    cleanup();
-  });
-
-  InitResult init = init_future.get();
-  if (!init.ok) {
-    stop->store(true, std::memory_order_relaxed);
-    if (worker.joinable()) worker.join();
-    *error = init.error;
+std::unique_ptr<BusyWorker> StartCublasWorker(int gpu_id, std::string* error) {
+  int init_pipe[2];
+  if (pipe2(init_pipe, O_CLOEXEC) != 0) {
+    *error = "pipe2: " + std::string(strerror(errno));
+    return nullptr;
+  }
+  int stop_pipe[2];
+  if (pipe2(stop_pipe, O_CLOEXEC | O_NONBLOCK) != 0) {
+    *error = "pipe2: " + std::string(strerror(errno));
+    close(init_pipe[0]);
+    close(init_pipe[1]);
     return nullptr;
   }
 
-  return std::make_unique<CublasBusyWorker>(std::move(worker), std::move(stop));
+  const pid_t pid = fork();
+  if (pid < 0) {
+    *error = "fork: " + std::string(strerror(errno));
+    close(init_pipe[0]);
+    close(init_pipe[1]);
+    close(stop_pipe[0]);
+    close(stop_pipe[1]);
+    return nullptr;
+  }
+
+  if (pid == 0) {
+    close(init_pipe[0]);
+    close(stop_pipe[1]);
+    const int code = RunCublasWorkerChild(gpu_id, init_pipe[1], stop_pipe[0]);
+    _exit(code);
+  }
+
+  close(init_pipe[1]);
+  close(stop_pipe[0]);
+  const std::string init = ReadAllFd(init_pipe[0]);
+  close(init_pipe[0]);
+  if (init != "OK") {
+    close(stop_pipe[1]);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (init.rfind("ERR ", 0) == 0) {
+      *error = init.substr(4);
+    } else {
+      *error = "busy worker exited before initialization completed";
+    }
+    return nullptr;
+  }
+
+  return std::make_unique<CublasBusyWorker>(pid, stop_pipe[1]);
 }
 
 }  // namespace

@@ -272,7 +272,7 @@ bool DeviceIsIdle(const Nvml& nvml, int id, nvmlDevice_t device,
     return false;
   }
 
-  if (memory.used != 0 || utilization.gpu != 0) {
+  if (utilization.gpu != 0) {
     std::ostringstream reason;
     reason << "GPU " << id << " memory.used=" << memory.used
            << " gpu_util=" << utilization.gpu << "%";
@@ -292,6 +292,11 @@ bool DeviceIsIdle(const Nvml& nvml, int id, nvmlDevice_t device,
                      std::to_string(pid);
       return true;
     }
+  }
+
+  if (memory.used != 0 && pids.empty()) {
+    busy_reason->clear();
+    return true;
   }
 
   busy_reason->clear();
