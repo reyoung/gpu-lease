@@ -184,6 +184,21 @@ class Nvml final {
                                          nvmlProcessInfo_t*) = nullptr;
 };
 
+Nvml* SharedNvml(std::string* error) {
+  // The NVIDIA driver keeps internal eventfds alive across
+  // nvmlShutdown()/dlclose().  Constructing a fresh Nvml object for every
+  // lease therefore leaked one daemon FD per acquire/release cycle and
+  // eventually caused EMFILE.  The daemon is single-process and serializes
+  // lease preparation, so one process-lifetime NVML session is sufficient.
+  static std::string initialization_error;
+  static Nvml nvml(&initialization_error);
+  if (!nvml.ok()) {
+    *error = initialization_error;
+    return nullptr;
+  }
+  return &nvml;
+}
+
 std::string ProcExeBasename(unsigned int pid) {
   const std::string path = "/proc/" + std::to_string(pid) + "/exe";
   std::vector<char> buffer(4096);
@@ -331,8 +346,8 @@ bool PrepareLeasedGPUs(const std::vector<int>& ids,
   effective.poll_ms = EnvInt("GPU_LEASE_PRESTART_POLL_MS", effective.poll_ms);
 
   std::string error;
-  Nvml nvml(&error);
-  if (!nvml.ok()) {
+  Nvml* nvml = SharedNvml(&error);
+  if (nvml == nullptr) {
     err << "lease: initialize NVML: " << error << "\n";
     return false;
   }
@@ -341,7 +356,7 @@ bool PrepareLeasedGPUs(const std::vector<int>& ids,
   devices.reserve(ids.size());
   for (const int id : ids) {
     nvmlDevice_t device = nullptr;
-    if (!nvml.Device(id, &device, &error)) {
+    if (!nvml->Device(id, &device, &error)) {
       err << "lease: " << error << "\n";
       return false;
     }
@@ -354,7 +369,7 @@ bool PrepareLeasedGPUs(const std::vector<int>& ids,
   while (true) {
     if (effective.kill_unmanaged_processes) {
       for (size_t i = 0; i < devices.size(); ++i) {
-        if (!KillUnmanagedProcessesOnDevice(nvml, ids[i], devices[i], err)) {
+        if (!KillUnmanagedProcessesOnDevice(*nvml, ids[i], devices[i], err)) {
           return false;
         }
       }
@@ -364,7 +379,7 @@ bool PrepareLeasedGPUs(const std::vector<int>& ids,
     if (effective.wait_until_idle) {
       for (size_t i = 0; i < devices.size(); ++i) {
         std::string busy_reason;
-        if (!DeviceIsIdle(nvml, ids[i], devices[i], err, &busy_reason)) {
+        if (!DeviceIsIdle(*nvml, ids[i], devices[i], err, &busy_reason)) {
           return false;
         }
         if (!busy_reason.empty()) {
